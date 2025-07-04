@@ -52,6 +52,44 @@ python msipatch.py \
   --arch x64
 ```
 
+### Add a DLL-based custom action:
+
+```console
+python msipatch.py \
+  --msi path/to/original.msi \
+  --add-action \
+  --action-name MyDllAction \
+  --action-type dll \
+  --action-file path/to/custom.dll \
+  --action-export MyExportedFunction \
+  --async
+```
+
+### Add an EXE-based custom action (from Binary table):
+
+```console
+python msipatch.py \
+  --msi path/to/original.msi \
+  --add-action \
+  --action-name RunMyExe \
+  --action-type exe \
+  --action-file path/to/myapp.exe \
+  --action-args "--do-stuff --quiet" \
+  --async
+```
+
+### Add a preinstalled command (cmd.exe / powershell.exe / whatever you need):
+
+```console
+python msipatch.py \
+  --msi path/to/original.msi \
+  --add-action \
+  --action-name RunCalc \
+  --action-type cmd \
+  --action-args 'cmd.exe /c "start calc.exe"' \
+  --async
+```
+
 ### Arguments
 
 | Option         | Description                                                                 |
