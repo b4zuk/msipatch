@@ -161,6 +161,41 @@ class InstallerDatabaseTables:
                     print(f"[+] Top-level feature detected: {cols[0]}")
                     return cols[0]
         raise RuntimeError("No top-level feature found in Feature.idt.")
+    
+
+    def get_next_install_sequence_number(self):
+        sequence_numbers = set()
+        step = 1
+        after_action = "InstallFiles"
+        after_action_seq = None
+
+        with open(self.instexecseq_idt, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        data_lines = lines[3:] if lines[0].startswith("s72") else lines
+
+        for line in data_lines:
+            parts = line.strip().split('\t')
+            if len(parts) < 3:
+                continue
+            action, condition, seq = parts
+            try:
+                seq_num = int(seq)
+            except ValueError:
+                continue
+            sequence_numbers.add(seq_num)
+            if action == after_action:
+                after_action_seq = seq_num
+
+        if after_action_seq is None:
+            raise ValueError(f"Action '{after_action}' not found in {self.instexecseq_idt}")
+
+        candidate = after_action_seq + step
+        while candidate in sequence_numbers:
+            candidate += step
+
+        print(f"[+] Install sequence number detected: {candidate}")
+        return candidate
 
 
     def modify_file_idt(self, file_cab_name, component_name, file_dest_name, filesize, file_sequence_number):
@@ -220,6 +255,37 @@ class InstallerDatabaseTables:
         with open(self.directory_idt, "w") as f:
             f.writelines(lines)
         return file_dest_dir_key
+    
+
+    def modify_binary_idt(self, file_path):
+        file_name = os.path.basename(file_path).split(".")[0]
+        dest_path = os.path.join('Binary', f"Binary.{file_name}")
+
+        shutil.copy(file_path, dest_path)
+        with open(self.binary_idt, "a") as f:
+            f.write(f"{file_name}\tBinary.{file_name}\n")
+        print("[i] Modified Binary.idt")
+        return file_name
+
+
+    def modify_install_execute_sequence_idt(self, action_name):
+        install_condition = ""
+        install_sequence_number = self.get_next_install_sequence_number()
+        with open(self.instexecseq_idt, "a") as f:
+            f.write(f"{action_name}\t{install_condition}\t{install_sequence_number}\n")
+        print("[i] Modified InstallExecuteSequence.idt")
+    
+
+    def modify_custom_action_idt(self, action_name, action_type, action_source, action_target):
+        if not os.path.exists(self.customact_idt):
+            with open(self.customact_idt, "w") as f:
+                f.write("Action\tType\tSource\tTarget\n")
+                f.write("s72\ti2\ts72\tL0\n")
+                f.write("CustomAction\tAction\n")
+
+        with open(self.customact_idt, "a") as f:
+            f.write(f"{action_name}\t{action_type}\t{action_source}\t{action_target}\n")
+        print("[i] Modified CustomAction.idt")
 
 
     def file_dropper(self, component_name, file_cab_name, file_dest_name, file_dest_dir, file_path):
@@ -238,9 +304,45 @@ class InstallerDatabaseTables:
         return ["Directory.idt", "Component.idt", "File.idt", "FeatureComponents.idt", "Media.idt"]
 
 
-    def custom_action(self):
+    def run_custom_exe_action(self, file_path, action_name, is_async, exe_args):
         print("[+] Modifying IDT files...")
-        pass
+        action_source = self.modify_binary_idt(file_path)
+        self.modify_install_execute_sequence_idt(action_name)
+
+        action_type = 2
+        if is_async:
+            action_type += 192
+        
+        action_target = exe_args
+        
+        self.modify_custom_action_idt(action_name, action_type, action_source, action_target)
+        return ["Binary.idt", "CustomAction.idt", "InstallExecuteSequence.idt"]
+ 
+
+    def run_custom_dll_action(self, file_path, action_name, is_async, exported_function):
+        print("[+] Modifying IDT files...")
+        action_source = self.modify_binary_idt(file_path)
+        self.modify_install_execute_sequence_idt(action_name)
+
+        action_type = 1
+        if is_async:
+            action_type += 64
+        
+        action_target = exported_function
+
+        self.modify_custom_action_idt(action_name, action_type, action_source, action_target)
+        return ["Binary.idt", "CustomAction.idt", "InstallExecuteSequence.idt"]
+
+
+    def run_custom_preinstalled_exe_action(self, action_name, command):
+        action_type = 226
+        action_source = "INSTALLDIR"
+        print(command)
+        action_target = command
+        
+        self.modify_install_execute_sequence_idt(action_name)
+        self.modify_custom_action_idt(action_name, action_type, action_source, action_target)
+        return ["CustomAction.idt", "InstallExecuteSequence.idt"]
 
 
 class CabinetFile:
@@ -396,6 +498,24 @@ def inject_file_into_msi(arch, msi_file_path, inject_file_path, file_cab_name, f
     msitool.embed_cab_file(cab_file_path)
 
 
+def inject_custom_action_into_msi(args):
+    msitool = MSITool(args.msi)
+    msitool.dump()
+
+    idt = InstallerDatabaseTables(args.msi, msitool.temp_dir)
+
+    if args.action_type == 'exe':
+        idt_list_in_order = idt.run_custom_exe_action(args.action_file, args.action_name, args.is_async, args.action_args)
+
+    if args.action_type == 'dll':
+        idt_list_in_order = idt.run_custom_dll_action(args.action_file, args.action_name, args.is_async, args.action_export)
+
+    if args.action_type == 'cmd':
+        idt_list_in_order = idt.run_custom_preinstalled_exe_action(args.action_name, args.action_args)
+
+    msitool.rebuild_msi_from_idts(idt_list_in_order)
+
+
 def check_required_tools_is_installed():
     # Map each tool to the package that provides it
     required_tools = {
@@ -423,26 +543,38 @@ def check_required_tools_is_installed():
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description=(
-            "MSIPatch: Inject files or custom actions into an existing MSI file."
-        ),
+        description="MSIPatch: Inject files or custom actions into an existing MSI file.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+
     parser.add_argument("-l", "--list", action="store_true", help="List available directory keys and exit")
     parser.add_argument("-m", "--msi", metavar="MSI", help="Path to the original MSI file")
+
+    # File dropper
     parser.add_argument("-i", "--file", metavar="FILE", help="File to inject into the MSI")
     parser.add_argument("-d", "--dest", metavar="DIR", default="system32", help="Destination folder key (e.g., system32, desktop)")
     parser.add_argument("-n", "--name", metavar="NAME", help="Target filename when dropped")
     parser.add_argument("-c", "--cab", metavar="CAB", help="Filename inside the CAB archive")
     parser.add_argument("-C", "--comp", metavar="COMP", default="MyComponent", help="MSI Component name")
+
+    # Custom action config
+    parser.add_argument("--add-action", action="store_true", help="Add a custom action")
+    parser.add_argument("--action-name", metavar="ACTION", help="Custom action name")
+    parser.add_argument("--action-type", choices=["exe", "dll", "cmd"], help="Type of custom action")
+    parser.add_argument("--action-file", metavar="FILE", help="EXE or DLL file to embed (not required for cmd)")
+    parser.add_argument("--action-export", metavar="FUNC", help="Exported DLL function (only for DLL actions)")
+    parser.add_argument("--action-args", metavar="ARGS", default="", help="Arguments for EXE (or cmd string for CMD)")
+    parser.add_argument("--async", dest="is_async", action="store_true", help="Run the custom action asynchronously")
+
     parser.add_argument("-a", "--arch", choices=["x86", "x64"], default="x86", metavar="ARCH", help="Target architecture")
 
     args = parser.parse_args()
 
-    # Logic rules
+    # Basic validation
     if not args.list and not args.msi:
         parser.error("--msi (-m) is required unless --list (-l) is used.")
 
+    # File injection validation
     if args.file:
         missing = []
         if not args.dest:
@@ -456,8 +588,20 @@ def parse_args():
         if missing:
             parser.error(f"The following arguments are required with --file: {', '.join(missing)}")
 
-    return args
+    # Custom action validation
+    if args.add_action:
+        if not args.action_name:
+            parser.error("--action-name is required with --add-action")
+        if not args.action_type:
+            parser.error("--action-type is required with --add-action")
 
+        if args.action_type in ["exe", "dll"] and not args.action_file:
+            parser.error("--action-file is required for EXE or DLL actions")
+
+        if args.action_type == "dll" and not args.action_export:
+            parser.error("--action-export is required for DLL actions")
+
+    return args
 
 def main():
     args = parse_args()
@@ -479,6 +623,10 @@ def main():
             file_dest_name=args.name,
             component_name=args.comp
         )
+        return
+    
+    if args.add_action:
+        inject_custom_action_into_msi(args)
         return
 
 
